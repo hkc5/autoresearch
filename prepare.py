@@ -15,6 +15,7 @@ import time
 import math
 import argparse
 import pickle
+import hashlib
 from multiprocessing import Pool
 
 import requests
@@ -174,9 +175,11 @@ def train_tokenizer():
         special_tokens=special_tokens,
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
+    # Save tokenizer with hash
+    def _save_tokenizer(enc, path):
+        with open(path, "wb") as f:
+            pickle.dump(enc, f)
+    _save_with_hash(enc, tokenizer_pkl, _save_tokenizer)
 
     t1 = time.time()
     print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
@@ -192,7 +195,7 @@ def train_tokenizer():
         else:
             token_bytes_list.append(len(token_str.encode("utf-8")))
     token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
+    _save_with_hash(token_bytes_tensor, token_bytes_path, lambda data, path: torch.save(data, path))
     print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
 
     # Sanity check
@@ -206,6 +209,35 @@ def train_tokenizer():
 # Runtime utilities (imported by train.py)
 # ---------------------------------------------------------------------------
 
+def _compute_file_hash(filepath):
+    """Compute SHA256 hash of a file."""
+    sha256 = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+
+def _save_with_hash(data, filepath, save_fn):
+    """Save data to file and compute/store its hash."""
+    save_fn(data, filepath)
+    file_hash = _compute_file_hash(filepath)
+    hash_path = filepath + ".hash"
+    with open(hash_path, "w") as f:
+        f.write(file_hash)
+
+
+def _verify_hash(filepath):
+    """Verify file integrity against stored hash. Returns True if valid or no hash exists."""
+    hash_path = filepath + ".hash"
+    if not os.path.exists(hash_path):
+        return True  # No hash to verify against
+    with open(hash_path, "r") as f:
+        expected_hash = f.read().strip()
+    actual_hash = _compute_file_hash(filepath)
+    return expected_hash == actual_hash
+
+
 class Tokenizer:
     """Minimal tokenizer wrapper. Training is handled above."""
 
@@ -215,8 +247,22 @@ class Tokenizer:
 
     @classmethod
     def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
+        tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
+        if not _verify_hash(tokenizer_path):
+            raise RuntimeError(
+                f"Tokenizer cache integrity check failed: {tokenizer_path}\n"
+                f"The cached tokenizer appears to be corrupted. "
+                f"Please delete {tokenizer_dir} and re-run prepare.py to regenerate."
+            )
+        try:
+            with open(tokenizer_path, "rb") as f:
+                enc = pickle.load(f)
+        except (pickle.UnpicklingError, EOFError, AttributeError, ImportError) as e:
+            raise RuntimeError(
+                f"Failed to load tokenizer from {tokenizer_path}: {e}\n"
+                f"The cached tokenizer may be corrupted or incompatible. "
+                f"Please delete {tokenizer_dir} and re-run prepare.py to regenerate."
+            ) from e
         return cls(enc)
 
     def get_vocab_size(self):
@@ -247,8 +293,21 @@ class Tokenizer:
 
 def get_token_bytes(device="cpu"):
     path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+    if not _verify_hash(path):
+        raise RuntimeError(
+            f"Token bytes cache integrity check failed: {path}\n"
+            f"The cached token_bytes appears to be corrupted. "
+            f"Please delete {TOKENIZER_DIR} and re-run prepare.py to regenerate."
+        )
+    try:
+        with open(path, "rb") as f:
+            return torch.load(f, map_location=device, weights_only=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load token_bytes from {path}: {e}\n"
+            f"The cached token_bytes may be corrupted. "
+            f"Please delete {TOKENIZER_DIR} and re-run prepare.py to regenerate."
+        ) from e
 
 
 def _document_batches(split, tokenizer_batch_size=128):
